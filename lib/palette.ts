@@ -1,16 +1,14 @@
-// Scala colori condivisa: score 0 (panico) -> 100 (euforia). Funzioni pure, usabili lato client.
+// Scala colori neon condivisa: score 0 (panico) -> 100 (euforia). Funzioni pure, usabili lato client.
 
 const STOPS: Array<{ at: number; rgb: [number, number, number] }> = [
-  { at: 0, rgb: [150, 10, 30] },
-  { at: 20, rgb: [220, 20, 60] },
-  { at: 30, rgb: [255, 69, 0] },
-  { at: 38, rgb: [255, 140, 0] },
-  { at: 48, rgb: [138, 43, 226] },
-  { at: 58, rgb: [157, 78, 221] },
-  { at: 68, rgb: [100, 149, 237] },
-  { at: 78, rgb: [0, 204, 255] },
-  { at: 90, rgb: [0, 255, 136] },
-  { at: 100, rgb: [0, 255, 136] },
+  { at: 0, rgb: [255, 0, 60] }, //     rosso fluo
+  { at: 22, rgb: [255, 42, 109] }, //  rosa shocking
+  { at: 38, rgb: [255, 140, 0] }, //   arancio fluo
+  { at: 50, rgb: [180, 92, 255] }, //  viola neon
+  { at: 62, rgb: [92, 108, 255] }, //  blu elettrico
+  { at: 76, rgb: [0, 229, 255] }, //   ciano
+  { at: 90, rgb: [57, 255, 20] }, //   verde acido
+  { at: 100, rgb: [57, 255, 20] },
 ];
 
 export function scoreToRgb(score: number): [number, number, number] {
@@ -26,12 +24,15 @@ export function scoreToRgb(score: number): [number, number, number] {
   return STOPS[STOPS.length - 1].rgb;
 }
 
+/** "r, g, b" da usare in CSS come rgba(var(--c), 0.3). */
+export const scoreToRgbVar = (score: number | null): string => (score === null ? '110, 110, 125' : scoreToRgb(score).join(', '));
+
 export function scoreToColor(score: number, alpha = 1): string {
   const [r, g, b] = scoreToRgb(score);
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-export const NO_DATA_COLOR = (alpha = 1) => `rgba(90, 90, 105, ${alpha})`;
+export const NO_DATA_COLOR = (alpha = 1) => `rgba(110, 110, 125, ${alpha})`;
 
 export function scoreLabel(score: number): string {
   if (score >= 85) return 'FOMO ESTREMO';
