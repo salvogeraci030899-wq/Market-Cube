@@ -18,6 +18,9 @@ Ogni faccia è una metrica con punteggio 0–100 (rosso = panico, viola = neutro
 - **Nessun dato inventato**: se una fonte non risponde la faccia diventa grigia ("n/d"); un dato recente ma non aggiornato resta al massimo 15 minuti, marcato "precedente". Se tutto è offline vedi l'ultimo snapshot con l'avviso "DATI VECCHI".
 - **Cache** di 30s nel browser, aggiornamento automatico ogni 60s (in pausa quando la scheda è nascosta).
 - Interazione: trascina per ruotare, clicca una metrica per portarla di fronte.
+- **Storico 90 giorni**: confronto "oggi vs ultimi 90 giorni" con percentile, minimo e massimo. Si ricostruisce subito da dati pubblici (BTC, ETH, trend 30g, Fear & Greed); funding e ampiezza non hanno uno storico gratuito e ne restano fuori.
+- **Zona alta/bassa**: quando oggi è tra il 10% più alto/basso degli ultimi 90 giorni il cubo si circonda di un alone pulsante e il titolo della scheda mostra ▲/▼ insieme al punteggio.
+- **Avvisi**: con il pulsante "Avvisi" il browser ti notifica al cambio di zona (una sola volta, non a ogni aggiornamento). Funzionano finché la scheda resta aperta.
 
 ## Uso in locale
 
