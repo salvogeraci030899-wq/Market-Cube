@@ -1,472 +1,339 @@
-// components/MarketCube/MarketCube.tsx
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import styles from './MarketCube.module.css';
+import { NO_DATA_COLOR, scoreLabel, scoreToColor } from '@/lib/palette';
+import type { MetricId, Snapshot } from '@/lib/market';
 
-interface MarketData {
-  sentiment: number;
-  volatility: number;
-  confidence: number;
-  marketRegime: string;
-  timestamp: number;
-  lastUpdated: string;
-  dataSources?: {
-    binance: string;
-    coingecko: string;
-    fearGreed: string;
-  };
-}
+const REFRESH_MS = 60_000;
+const HISTORY_MAX = 90;
+const IDLE_RESUME_MS = 6000;
 
-const COLOR_RANGES = [
-  { min: 85, color: 'rgba(0, 255, 136, 0.95)', label: 'FOMO ESTREMO' },
-  { min: 75, color: 'rgba(0, 204, 255, 0.90)', label: 'OTTIMISMO FORTE' },
-  { min: 65, color: 'rgba(100, 149, 237, 0.85)', label: 'OTTIMISMO' },
-  { min: 55, color: 'rgba(157, 78, 221, 0.80)', label: 'LEGGERO OTTIMISMO' },
-  { min: 45, color: 'rgba(138, 43, 226, 0.75)', label: 'NEUTRO-POSITIVO' },
-  { min: 40, color: 'rgba(186, 85, 211, 0.70)', label: 'NEUTRO-NEGATIVO' },
-  { min: 35, color: 'rgba(255, 140, 0, 0.65)', label: 'CAUTELA' },
-  { min: 30, color: 'rgba(255, 69, 0, 0.60)', label: 'PESSIMISMO' },
-  { min: 20, color: 'rgba(220, 20, 60, 0.55)', label: 'PESSIMISMO FORTE' },
-  { min: 0,  color: 'rgba(139, 0, 0, 0.50)', label: 'PANICO' }
+// Quale metrica sta su quale faccia, e come ruotare il cubo per portarla di fronte.
+const FACES: Array<{ id: MetricId; cls: string; view: { rx: number; ry: number } }> = [
+  { id: 'btc', cls: 'front', view: { rx: 12, ry: 0 } },
+  { id: 'eth', cls: 'back', view: { rx: 12, ry: 180 } },
+  { id: 'fng', cls: 'right', view: { rx: 12, ry: -90 } },
+  { id: 'trend', cls: 'left', view: { rx: 12, ry: 90 } },
+  { id: 'breadth', cls: 'top', view: { rx: -80, ry: 0 } },
+  { id: 'funding', cls: 'bottom', view: { rx: 80, ry: 0 } },
 ];
 
+const shortestDelta = (from: number, to: number) => ((((to - from) % 360) + 540) % 360) - 180;
+
+function Sparkline({ values }: { values: number[] }) {
+  if (values.length < 2) return <span className={styles.muted}>raccolta storico…</span>;
+  const w = 120;
+  const h = 28;
+  const pts = values
+    .map((v, i) => `${((i / (values.length - 1)) * w).toFixed(1)},${(h - (v / 100) * h).toFixed(1)}`)
+    .join(' ');
+  return (
+    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} aria-label="Andamento del sentiment in questa sessione">
+      <line x1="0" x2={w} y1={h / 2} y2={h / 2} stroke="rgba(255,255,255,0.15)" strokeDasharray="2 3" />
+      <polyline points={pts} fill="none" stroke="rgba(255,255,255,0.85)" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
 export default function MarketCube() {
-  const sceneRef = useRef<HTMLDivElement>(null);
   const cubeRef = useRef<HTMLDivElement>(null);
-  const [marketData, setMarketData] = useState<MarketData | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState<Snapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const animationRef = useRef<number>();
+  const [loading, setLoading] = useState(true);
+  const [history, setHistory] = useState<number[]>([]);
+  const [now, setNow] = useState(() => Date.now());
 
-  // Fetch dati REALI dal nostro API
-  const fetchMarketData = async () => {
+  const dataRef = useRef<Snapshot | null>(null);
+  dataRef.current = data;
+
+  // ---- caricamento dati (solo dal nostro endpoint; nessun fallback inventato)
+  const inflight = useRef<AbortController | null>(null);
+  const load = useCallback(async () => {
+    inflight.current?.abort();
+    const ctrl = new AbortController();
+    inflight.current = ctrl;
+    setLoading(true);
     try {
-      setLoading(true);
-      const response = await fetch('/api/market-data');
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`API error ${response.status}: ${errorText}`);
-      }
-      
-      const data = await response.json();
-      
-      // Se l'API ritorna dati demo per qualche motivo, convertili in "reali"
-      if (data.isDemo) {
-        // Tenta una fetch diretta alle API esterne come fallback
-        const fallbackData = await fetchDirectAPIs();
-        setMarketData(fallbackData);
-      } else {
-        setMarketData(data);
-      }
-      
+      const res = await fetch('/api/market-data', { signal: ctrl.signal, cache: 'no-store' });
+      if (!res.ok) throw new Error(`Errore server (${res.status})`);
+      const snap: Snapshot = await res.json();
+      setData(snap);
       setError(null);
-    } catch (err) {
-      console.error('Error fetching market data:', err);
-      setError(err instanceof Error ? err.message : 'Failed to fetch market data');
-      
-      // Tenta comunque di ottenere dati dai backup
-      try {
-        const fallbackData = await fetchDirectAPIs();
-        setMarketData(fallbackData);
-        setError(null); // Clear error se fallback funziona
-      } catch (fallbackError) {
-        console.error('Fallback also failed:', fallbackError);
+      if (snap.sentiment !== null && !snap.stale) {
+        setHistory((h) => [...h, snap.sentiment as number].slice(-HISTORY_MAX));
       }
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') return;
+      setError(e instanceof Error ? e.message : 'Errore di rete');
     } finally {
-      setLoading(false);
+      if (inflight.current === ctrl) setLoading(false);
     }
-  };
-
-  // Fallback: fetch diretto alle API esterne (solo se necessario)
-  const fetchDirectAPIs = async (): Promise<MarketData> => {
-    try {
-      // Prova a fetchare da diverse API direttamente
-      const [binanceRes, coingeckoRes, fearGreedRes] = await Promise.allSettled([
-        fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT'),
-        fetch('https://api.coingecko.com/api/v3/global'),
-        fetch('https://api.alternative.me/fng/?limit=1&format=json')
-      ]);
-
-      // Processa i dati
-      let priceChange = 0;
-      let btcDominance = 50;
-      let fearGreedValue = 50;
-
-      if (binanceRes.status === 'fulfilled' && binanceRes.value.ok) {
-        const data = await binanceRes.value.json();
-        priceChange = parseFloat(data.priceChangePercent) || 0;
-      }
-
-      if (coingeckoRes.status === 'fulfilled' && coingeckoRes.value.ok) {
-        const data = await coingeckoRes.value.json();
-        btcDominance = data.data?.market_cap_percentage?.btc || 50;
-      }
-
-      if (fearGreedRes.status === 'fulfilled' && fearGreedRes.value.ok) {
-        const data = await fearGreedRes.value.json();
-        fearGreedValue = parseInt(data.data?.[0]?.value) || 50;
-      }
-
-      // Calcola sentiment (algoritmo semplificato)
-      const sentiment = 50 + (priceChange * 2) + ((fearGreedValue - 50) * 0.5);
-      const volatility = 1.0 + Math.abs(priceChange) / 10;
-      const confidence = 80; // Alta confidence per dati diretti
-
-      return {
-        sentiment: Math.max(0, Math.min(100, sentiment)),
-        volatility: Math.max(0.5, Math.min(3.0, volatility)),
-        confidence,
-        marketRegime: getMarketRegime(sentiment, volatility),
-        timestamp: Date.now(),
-        lastUpdated: new Date().toISOString(),
-        dataSources: {
-          binance: binanceRes.status === 'fulfilled' ? 'online' : 'offline',
-          coingecko: coingeckoRes.status === 'fulfilled' ? 'online' : 'offline',
-          fearGreed: fearGreedRes.status === 'fulfilled' ? 'online' : 'offline'
-        }
-      };
-    } catch (error) {
-      console.error('Direct API fetch failed:', error);
-      
-      // Ultima risorsa: dati basati sull'ora del giorno (ma non chiamarli "demo")
-      return generateRealTimeData();
-    }
-  };
-
-  // Genera dati realistici basati sull'ora (per fallback estremo)
-  const generateRealTimeData = (): MarketData => {
-    const now = new Date();
-    const hour = now.getHours();
-    
-    // Simula comportamenti di mercato reali basati sull'ora
-    let sentiment = 50;
-    if (hour >= 14 && hour < 22) sentiment = 60; // Trading US
-    else if (hour >= 8 && hour < 14) sentiment = 55; // Trading EU
-    else sentiment = 48; // Trading Asia
-    
-    // Aggiungi casualità realistica
-    sentiment += (Math.random() - 0.5) * 15;
-    
-    const volatility = 0.9 + Math.random() * 1.1;
-    const confidence = 65 + Math.random() * 20;
-    
-    return {
-      sentiment: Math.max(0, Math.min(100, sentiment)),
-      volatility: Math.round(volatility * 100) / 100,
-      confidence: Math.round(confidence),
-      marketRegime: getMarketRegime(sentiment, volatility),
-      timestamp: Date.now(),
-      lastUpdated: new Date().toISOString()
-    };
-  };
-
-  const getMarketRegime = (sentiment: number, volatility: number): string => {
-    if (volatility > 2.0) {
-      if (sentiment > 70) return 'PARABOLIC BULL';
-      if (sentiment > 55) return 'VOLATILE NEUTRAL';
-      return 'CAPITULATION';
-    }
-    
-    if (sentiment > 70) return 'STRONG BULLISH';
-    if (sentiment > 60) return 'BULLISH';
-    if (sentiment > 50) return 'SLIGHTLY BULLISH';
-    if (sentiment > 40) return 'SLIGHTLY BEARISH';
-    if (sentiment > 30) return 'BEARISH';
-    return 'STRONG BEARISH';
-  };
-
-  // Inizializzazione
-  useEffect(() => {
-    fetchMarketData();
-    
-    // Aggiorna ogni 30 secondi (realtime)
-    const interval = setInterval(fetchMarketData, 30000);
-    
-    return () => {
-      clearInterval(interval);
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
-      }
-    };
   }, []);
 
-  // Animazione basata sui dati REALI
   useEffect(() => {
-    if (!sceneRef.current || !cubeRef.current || !marketData) return;
-    
-    let lastTime = 0;
-    const rotationSpeed = 0.5 + marketData.volatility * 0.5;
-    
-    const animate = (timestamp: number) => {
-      if (!lastTime) lastTime = timestamp;
-      
-      const delta = timestamp - lastTime;
-      lastTime = timestamp;
-      
-      const rotationY = (timestamp * 0.001 * rotationSpeed) % 360;
-      
-      // Effetti visivi BASATI SU DATI REALI
-      const baseWobble = Math.sin(timestamp * 0.001) * 0.2;
-      const volatilityWobble = Math.sin(timestamp * 0.002) * 0.3 * marketData.volatility;
-      const confidenceWobble = Math.sin(timestamp * 0.0015) * 0.1 * (1 - marketData.confidence / 100);
-      
-      // Shake per alta volatilità REALE
-      let shakeX = 0, shakeY = 0;
-      if (marketData.volatility > 2.0) {
-        shakeX = Math.sin(timestamp * 0.02) * 0.3;
-        shakeY = Math.cos(timestamp * 0.017) * 0.3;
-      }
-      
-      // Vibrazione per bassa confidence REALE
-      let vibrationX = 0, vibrationY = 0;
-      if (marketData.confidence < 70) {
-        vibrationX = Math.sin(timestamp * 0.015) * (1 - marketData.confidence / 100);
-        vibrationY = Math.cos(timestamp * 0.012) * (1 - marketData.confidence / 100);
-      }
-      
-      cubeRef.current!.style.transform = `
-        rotateX(${15 + baseWobble + volatilityWobble + confidenceWobble}deg)
-        rotateY(${rotationY}deg)
-        scale(${1 + marketData.volatility * 0.03})
-        translate(${vibrationX + shakeX}px, ${vibrationY + shakeY}px)
-      `;
-      
-      animationRef.current = requestAnimationFrame(animate);
+    load();
+    const poll = setInterval(() => {
+      if (!document.hidden) load();
+    }, REFRESH_MS);
+    const tick = setInterval(() => setNow(Date.now()), 5000);
+    const onVisible = () => {
+      const d = dataRef.current;
+      if (!document.hidden && (!d || Date.now() - d.fetchedAt > REFRESH_MS)) load();
     };
-    
-    animationRef.current = requestAnimationFrame(animate);
-    
+    document.addEventListener('visibilitychange', onVisible);
     return () => {
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
-      }
+      clearInterval(poll);
+      clearInterval(tick);
+      document.removeEventListener('visibilitychange', onVisible);
+      inflight.current?.abort();
     };
-  }, [marketData]);
+  }, [load]);
 
-  // Calcola colore basato sul sentiment REALE
-  const getColorForSentiment = (sentiment: number) => {
-    for (let i = 0; i < COLOR_RANGES.length - 1; i++) {
-      const current = COLOR_RANGES[i];
-      const next = COLOR_RANGES[i + 1];
-      
-      if (sentiment >= current.min && sentiment < next.min) {
-        const range = next.min - current.min;
-        const position = (sentiment - current.min) / range;
-        
-        const curColor = hexToRgb(current.color);
-        const nextColor = hexToRgb(next.color);
-        
-        const r = Math.round(curColor.r + (nextColor.r - curColor.r) * position);
-        const g = Math.round(curColor.g + (nextColor.g - curColor.g) * position);
-        const b = Math.round(curColor.b + (nextColor.b - curColor.b) * position);
-        const a = curColor.a + (nextColor.a - curColor.a) * position;
-        
-        return `rgba(${r}, ${g}, ${b}, ${a})`;
+  // ---- animazione del cubo
+  const vol = data?.volatility.index ?? 1;
+  const coverage = data ? data.coverage.available / data.coverage.total : 1;
+  const motion = useRef({ vol: 1, coverage: 1 });
+  motion.current = { vol, coverage };
+
+  const rot = useRef({ rx: 12, ry: -25 });
+  const focus = useRef<{ rx: number; ry: number } | null>(null);
+  const drag = useRef<{ x: number; y: number; id: number } | null>(null);
+  const lastInteraction = useRef(0);
+  const [activeFace, setActiveFace] = useState<MetricId | null>(null);
+
+  const hasData = data !== null; // il cubo esiste nel DOM solo dopo il primo caricamento
+  useEffect(() => {
+    const el = cubeRef.current;
+    if (!el) return;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let raf = 0;
+    let last = 0;
+
+    const frame = (t: number) => {
+      const dt = last ? Math.min(t - last, 100) : 16;
+      last = t;
+      const { vol: v, coverage: cov } = motion.current;
+      const r = rot.current;
+      const interacting = drag.current !== null;
+
+      if (!interacting) {
+        if (focus.current) {
+          // verso la faccia scelta, con easing
+          r.ry += shortestDelta(r.ry, focus.current.ry) * Math.min(1, dt * 0.008);
+          r.rx += (focus.current.rx - r.rx) * Math.min(1, dt * 0.008);
+          if (performance.now() - lastInteraction.current > IDLE_RESUME_MS) {
+            focus.current = null;
+            setActiveFace(null);
+          }
+        } else {
+          const speed = reduce ? 4 : 6 + v * 8; // gradi/secondo: più volatilità = più veloce
+          r.ry = (r.ry + (speed * dt) / 1000) % 360;
+          r.rx += (12 - r.rx) * Math.min(1, dt * 0.004);
+        }
       }
-    }
-    
-    return sentiment >= COLOR_RANGES[0].min 
-      ? COLOR_RANGES[0].color 
-      : COLOR_RANGES[COLOR_RANGES.length - 1].color;
+
+      let wobble = 0;
+      let jx = 0;
+      let jy = 0;
+      if (!reduce) {
+        wobble = Math.sin(t * 0.0012) * (1 + v) * 1.2;
+        if (v >= 2) {
+          jx = Math.sin(t * 0.021) * 1.2;
+          jy = Math.cos(t * 0.017) * 1.2;
+        }
+        if (cov < 0.7) {
+          // pochi dati affidabili: leggera instabilità visibile
+          jx += Math.sin(t * 0.015) * (1 - cov) * 3;
+          jy += Math.cos(t * 0.012) * (1 - cov) * 3;
+        }
+      }
+      const scale = 1 + (v - 1) * 0.03;
+      el.style.transform = `translate(${jx}px, ${jy}px) scale(${scale}) rotateX(${r.rx + wobble}deg) rotateY(${r.ry}deg)`;
+      raf = requestAnimationFrame(frame);
+    };
+    raf = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(raf);
+  }, [hasData]);
+
+  const onPointerDown = (e: React.PointerEvent) => {
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    drag.current = { x: e.clientX, y: e.clientY, id: e.pointerId };
+    focus.current = null;
+    setActiveFace(null);
+    lastInteraction.current = performance.now();
+  };
+  const onPointerMove = (e: React.PointerEvent) => {
+    const d = drag.current;
+    if (!d) return;
+    rot.current.ry += (e.clientX - d.x) * 0.5;
+    rot.current.rx = Math.max(-90, Math.min(90, rot.current.rx - (e.clientY - d.y) * 0.5));
+    d.x = e.clientX;
+    d.y = e.clientY;
+  };
+  const endDrag = () => {
+    drag.current = null;
   };
 
-  const hexToRgb = (hex: string) => {
-    const match = hex.match(/rgba?\((\d+),\s*(\d+),\s*(\d+),?\s*(\d*\.?\d+)?\)/);
-    if (match) {
-      return {
-        r: parseInt(match[1]),
-        g: parseInt(match[2]),
-        b: parseInt(match[3]),
-        a: parseFloat(match[4]) || 1
-      };
-    }
-    return { r: 138, g: 43, b: 226, a: 0.75 };
+  const showFace = (id: MetricId) => {
+    const f = FACES.find((x) => x.id === id);
+    if (!f) return;
+    focus.current = f.view;
+    lastInteraction.current = performance.now();
+    setActiveFace(id);
   };
 
-  const formatTime = (timestamp: number) => {
-    return new Date(timestamp).toLocaleTimeString([], { 
-      hour: '2-digit', 
-      minute: '2-digit',
-      second: '2-digit'
-    });
-  };
-
-  if (loading && !marketData) {
+  // ---- render
+  if (!data) {
     return (
-      <div className={styles.loading}>
-        <div className={styles.spinner}></div>
-        <p>Loading LIVE market data...</p>
+      <div className={styles.center}>
+        {error ? (
+          <>
+            <h2>Dati non raggiungibili</h2>
+            <p className={styles.muted}>{error}</p>
+            <button className={styles.button} onClick={load}>
+              Riprova
+            </button>
+          </>
+        ) : (
+          <>
+            <div className={styles.spinner} />
+            <p className={styles.muted}>Carico i dati di mercato…</p>
+          </>
+        )}
       </div>
     );
   }
 
-  if (error && !marketData) {
-    return (
-      <div className={styles.errorContainer}>
-        <h2>⚠️ Connection Error</h2>
-        <p>{error}</p>
-        <button onClick={fetchMarketData} className={styles.retryButton}>
-          Retry Connection
-        </button>
-        <p className={styles.errorNote}>
-          Attempting to fetch data directly from exchanges...
-        </p>
-      </div>
-    );
-  }
-
-  if (!marketData) {
-    return null;
-  }
-
-  const color = getColorForSentiment(marketData.sentiment);
+  const sentiment = data.sentiment;
+  const headColor = sentiment === null ? NO_DATA_COLOR() : scoreToColor(sentiment);
+  const ageSec = Math.max(0, Math.round((now - data.fetchedAt) / 1000));
+  const age = ageSec < 90 ? `${ageSec}s fa` : `${Math.round(ageSec / 60)} min fa`;
+  const outdated = data.stale || error !== null;
+  const byId = new Map(data.metrics.map((m) => [m.id, m]));
 
   return (
-    <div className={styles.container}>
-      <div className={styles.header}>
-        <h1 className={styles.title}>MARKET CUBE PRO</h1>
-        <span className={styles.badge}>LIVE</span>
-      </div>
-      
-      {error && (
-        <div className={styles.warning}>
-          ⚠️ Partial data available: {error}
+    <main className={styles.container}>
+      <header className={styles.header}>
+        <h1 className={styles.title}>MARKET CUBE</h1>
+        <span className={`${styles.badge} ${outdated ? styles.badgeStale : ''}`}>
+          {outdated ? 'DATI VECCHI' : 'LIVE'}
+        </span>
+      </header>
+
+      {outdated && (
+        <div className={styles.warning} role="status">
+          {data.stale
+            ? `Le fonti non rispondono: mostro l'ultimo dato valido (${age}).`
+            : `Aggiornamento fallito (${error}). Mostro l'ultimo dato (${age}).`}
         </div>
       )}
-      
-      <div className={styles.sceneContainer}>
-        <div className={styles.scene} ref={sceneRef}>
+
+      <section className={styles.stage} aria-label="Cubo 3D del sentiment: trascina per ruotarlo">
+        <div
+          className={styles.scene}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={endDrag}
+          onPointerCancel={endDrag}
+        >
           <div className={styles.cube} ref={cubeRef}>
-            {['front', 'back', 'right', 'left', 'top', 'bottom'].map((face) => (
-              <div
-                key={face}
-                className={styles.face}
-                style={{
-                  backgroundColor: color,
-                  borderColor: color.replace(')', ', 0.4)').replace('rgba', 'rgba'),
-                  boxShadow: (marketData.sentiment > 80 || marketData.sentiment < 20)
-                    ? `0 0 ${10 + Math.abs(marketData.sentiment - 50) / 5}px ${color}`
-                    : 'none',
-                }}
-              />
-            ))}
+            {FACES.map(({ id, cls }) => {
+              const m = byId.get(id);
+              const score = m?.score ?? null;
+              const color = score === null ? NO_DATA_COLOR(0.55) : scoreToColor(score, 0.78);
+              const strong = score !== null && (score > 80 || score < 20);
+              return (
+                <div
+                  key={id}
+                  className={`${styles.face} ${styles[cls]} ${activeFace === id ? styles.faceActive : ''}`}
+                  style={{
+                    backgroundColor: color,
+                    boxShadow: strong ? `inset 0 0 40px ${scoreToColor(score as number, 0.9)}` : undefined,
+                  }}
+                >
+                  <span className={styles.faceLabel}>{m?.label ?? id}</span>
+                  <span className={styles.faceValue}>{m?.value ?? 'n/d'}</span>
+                  {m?.stale && <span className={styles.faceStale}>dato precedente</span>}
+                </div>
+              );
+            })}
           </div>
         </div>
-      </div>
-      
-      <div className={styles.dashboard}>
-        <div className={styles.stats}>
-          <div className={styles.stat}>
-            <span className={styles.statLabel}>Sentiment</span>
-            <span className={styles.statValue} style={{ color }}>
-              {marketData.sentiment.toFixed(1)}
-            </span>
-            <div className={styles.statSubtitle}>
-              {marketData.sentiment > 50 ? 'Bullish' : 'Bearish'}
-            </div>
+        <p className={styles.hint}>Trascina per ruotare · clicca una metrica per vederla sul cubo</p>
+      </section>
+
+      <section className={styles.panel}>
+        <div className={styles.summary}>
+          <div className={styles.score} style={{ color: headColor }}>
+            {sentiment === null ? '—' : sentiment.toFixed(0)}
+            <small>/100</small>
           </div>
-          
-          <div className={styles.stat}>
-            <span className={styles.statLabel}>Volatility</span>
-            <span className={styles.statValue}>
-              {marketData.volatility.toFixed(2)}x
-            </span>
-            <div className={styles.statSubtitle}>
-              {marketData.volatility > 2.0 ? 'High' : marketData.volatility > 1.0 ? 'Normal' : 'Low'}
-            </div>
+          <div>
+            <div className={styles.regime}>{data.regime}</div>
+            <div className={styles.muted}>{sentiment === null ? 'servono almeno 3 fonti' : scoreLabel(sentiment)}</div>
           </div>
-          
-          <div className={styles.stat}>
-            <span className={styles.statLabel}>Confidence</span>
-            <span className={styles.statValue}>
-              {marketData.confidence.toFixed(0)}%
-            </span>
-            <div className={styles.statSubtitle}>
-              {marketData.confidence > 80 ? 'High' : marketData.confidence > 60 ? 'Medium' : 'Low'}
-            </div>
-          </div>
-          
-          <div className={styles.stat}>
-            <span className={styles.statLabel}>Regime</span>
-            <span className={styles.statValue}>
-              {marketData.marketRegime}
-            </span>
-            <div className={styles.statSubtitle}>
-              {marketData.sentiment > 60 ? '🟢' : marketData.sentiment > 40 ? '🟡' : '🔴'}
-            </div>
+          <div className={styles.spark}>
+            <Sparkline values={history} />
           </div>
         </div>
-        
-        <div className={styles.info}>
-          <div className={styles.updateTime}>
-            LIVE update: {formatTime(marketData.timestamp)}
-          </div>
-          
-          {marketData.dataSources && (
-            <div className={styles.dataSources}>
-              Sources:&nbsp;
-              <span className={marketData.dataSources.binance === 'online' ? styles.online : styles.offline}>
-                Binance
-              </span>
-              &nbsp;•&nbsp;
-              <span className={marketData.dataSources.coingecko === 'online' ? styles.online : styles.offline}>
-                CoinGecko
-              </span>
-              &nbsp;•&nbsp;
-              <span className={marketData.dataSources.fearGreed === 'online' ? styles.online : styles.offline}>
-                Fear & Greed
-              </span>
-            </div>
-          )}
-          
-          <div className={styles.status}>
-            <span className={styles.statusIndicator}></span>
-            Live data streaming
-          </div>
-        </div>
-        
-        <div className={styles.controls}>
-          <button 
-            className={styles.refreshButton}
-            onClick={fetchMarketData}
-            disabled={loading}
-          >
-            {loading ? (
-              <>
-                <span className={styles.spinnerSmall}></span>
-                Updating...
-              </>
-            ) : (
-              '🔄 Refresh Now'
-            )}
-          </button>
-          
-          <div className={styles.autoUpdate}>
-            <span>Auto-update: 30s</span>
-          </div>
-        </div>
-      </div>
-      
-      <div className={styles.colorLegend}>
-        <div className={styles.legendTitle}>Market Sentiment</div>
-        <div className={styles.colorScale}>
-          {COLOR_RANGES.map((range, index) => (
-            <div 
-              key={index}
-              className={styles.colorItem}
-              style={{ backgroundColor: range.color }}
-              title={range.label}
-            />
+
+        <ul className={styles.metrics}>
+          {data.metrics.map((m) => (
+            <li key={m.id}>
+              <button
+                className={`${styles.metric} ${activeFace === m.id ? styles.metricActive : ''}`}
+                onClick={() => showFace(m.id)}
+              >
+                <span className={styles.metricName}>{m.label}</span>
+                <span className={styles.metricValue}>{m.value}</span>
+                <span className={styles.bar}>
+                  <span
+                    className={styles.barFill}
+                    style={{
+                      width: `${m.score ?? 0}%`,
+                      background: m.score === null ? 'transparent' : scoreToColor(m.score),
+                      opacity: m.stale ? 0.45 : 1,
+                    }}
+                  />
+                </span>
+                <span className={styles.metricDetail}>{m.stale ? `${m.detail} · precedente` : m.detail}</span>
+              </button>
+            </li>
           ))}
+        </ul>
+
+        <div className={styles.footer}>
+          <span title="Volatilità realizzata BTC sulle ultime 24h, annualizzata. Il cubo ruota più veloce e vibra quando è alta (2x = 100%).">
+            Volatilità:{' '}
+            {data.volatility.annualizedPct === null
+              ? 'n/d'
+              : `${data.volatility.annualizedPct.toFixed(0)}% ann. (${(data.volatility.index ?? 1).toFixed(1)}x)`}
+            {data.volatility.stale ? ' · precedente' : ''}
+          </span>
+          <span>Dominance BTC: {data.dominance === null ? 'n/d' : `${data.dominance.toFixed(1)}%`}</span>
+          <span>
+            Copertura: {data.coverage.available}/{data.coverage.total}
+          </span>
+          <span>
+            Fonti:{' '}
+            {Object.entries(data.sources).map(([name, ok], i) => (
+              <span key={name}>
+                {i > 0 && ' · '}
+                <span className={ok ? styles.online : styles.offline}>{name}</span>
+              </span>
+            ))}
+          </span>
+          <span>Aggiornato {age}</span>
+          <button className={styles.button} onClick={load} disabled={loading}>
+            {loading ? 'Aggiorno…' : 'Aggiorna'}
+          </button>
         </div>
-        <div className={styles.legendLabels}>
-          <span>PANIC</span>
-          <span>NEUTRAL</span>
-          <span>FOMO</span>
-        </div>
-      </div>
-    </div>
+        <p className={styles.disclaimer}>
+          Indicatore informativo, non è un consiglio finanziario. Ogni faccia è un punteggio 0–100 (rosso = panico, viola =
+          neutro, verde = euforia); il totale è una media pesata delle sole metriche disponibili.
+        </p>
+      </section>
+    </main>
   );
 }
