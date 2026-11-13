@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import styles from './MarketCube.module.css';
 import { NO_DATA_COLOR, scoreLabel, scoreToColor } from '@/lib/palette';
-import type { MetricId, Snapshot } from '@/lib/market';
+import { getSnapshot, type MetricId, type Snapshot } from '@/lib/market';
 
 const REFRESH_MS = 60_000;
 const HISTORY_MAX = 90;
@@ -47,27 +47,25 @@ export default function MarketCube() {
   const dataRef = useRef<Snapshot | null>(null);
   dataRef.current = data;
 
-  // ---- caricamento dati (solo dal nostro endpoint; nessun fallback inventato)
-  const inflight = useRef<AbortController | null>(null);
-  const load = useCallback(async () => {
-    inflight.current?.abort();
-    const ctrl = new AbortController();
-    inflight.current = ctrl;
+  // ---- caricamento dati: direttamente dal browser verso le API pubbliche (nessun server, nessun dato inventato)
+  const reqId = useRef(0);
+  const lastPoint = useRef(0);
+  const load = useCallback(async (force = false) => {
+    const id = ++reqId.current;
     setLoading(true);
     try {
-      const res = await fetch('/api/market-data', { signal: ctrl.signal, cache: 'no-store' });
-      if (!res.ok) throw new Error(`Errore server (${res.status})`);
-      const snap: Snapshot = await res.json();
+      const snap = await getSnapshot(force ? 0 : 30_000);
+      if (id !== reqId.current) return; // risposta superata da una richiesta più recente
       setData(snap);
       setError(null);
-      if (snap.sentiment !== null && !snap.stale) {
+      if (snap.sentiment !== null && !snap.stale && snap.fetchedAt !== lastPoint.current) {
+        lastPoint.current = snap.fetchedAt;
         setHistory((h) => [...h, snap.sentiment as number].slice(-HISTORY_MAX));
       }
     } catch (e) {
-      if ((e as Error).name === 'AbortError') return;
-      setError(e instanceof Error ? e.message : 'Errore di rete');
+      if (id === reqId.current) setError(e instanceof Error ? e.message : 'Errore di rete');
     } finally {
-      if (inflight.current === ctrl) setLoading(false);
+      if (id === reqId.current) setLoading(false);
     }
   }, []);
 
@@ -86,7 +84,6 @@ export default function MarketCube() {
       clearInterval(poll);
       clearInterval(tick);
       document.removeEventListener('visibilitychange', onVisible);
-      inflight.current?.abort();
     };
   }, [load]);
 
@@ -191,7 +188,7 @@ export default function MarketCube() {
           <>
             <h2>Dati non raggiungibili</h2>
             <p className={styles.muted}>{error}</p>
-            <button className={styles.button} onClick={load}>
+            <button className={styles.button} onClick={() => load(true)}>
               Riprova
             </button>
           </>
@@ -216,8 +213,8 @@ export default function MarketCube() {
     <main className={styles.container}>
       <header className={styles.header}>
         <h1 className={styles.title}>MARKET CUBE</h1>
-        <span className={`${styles.badge} ${outdated ? styles.badgeStale : ''}`}>
-          {outdated ? 'DATI VECCHI' : 'LIVE'}
+        <span className={`${styles.badge} ${outdated || data.coverage.available === 0 ? styles.badgeStale : ''}`}>
+          {data.coverage.available === 0 ? 'NESSUN DATO' : outdated ? 'DATI VECCHI' : 'LIVE'}
         </span>
       </header>
 
@@ -336,7 +333,7 @@ export default function MarketCube() {
               ))}
             </span>
             <span className={styles.muted}>Aggiornato {age}</span>
-            <button className={styles.button} onClick={load} disabled={loading}>
+            <button className={styles.button} onClick={() => load(true)} disabled={loading}>
               {loading ? 'Aggiorno…' : 'Aggiorna'}
             </button>
           </div>
