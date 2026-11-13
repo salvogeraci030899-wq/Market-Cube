@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  aggregate, buildSnapshot, getSnapshot, mergeWithPrevious, realizedVolAnnualizedPct,
+  aggregate, buildHistory, buildSnapshot, computeContext, getSnapshot, mergeWithPrevious, realizedVolAnnualizedPct,
   regimeFor, resetCache, scoreFunding, scoreMomentum, scoreTrend, type Fetcher, type Metric,
 } from '../lib/market';
 
@@ -15,15 +15,18 @@ const coins = [
   })),
 ];
 const hourly = Array.from({ length: 49 }, (_, i) => 70000 * (1 + (i % 2 ? 0.004 : -0.004)));
-const daily = Array.from({ length: 30 }, (_, i) => 60000 + i * 400);
+const dailyOf = (n: number, base: number) => Array.from({ length: n }, (_, i) => base * (1 + Math.sin(i / 6) * 0.08 + i * 0.001));
+const fngHistory = Array.from({ length: 90 }, (_, i) => ({ value: String(40 + Math.round(Math.sin(i / 5) * 25)), value_classification: 'Neutral' }));
 
 function route(url: string, down: string[] = []): unknown {
   if (down.some((d) => url.includes(d))) throw new Error('down');
   if (url.includes('coins/markets')) return coins;
   if (url.includes('coingecko.com/api/v3/global')) return { data: { market_cap_percentage: { btc: 57.3 } } };
-  if (url.includes('alternative.me')) return { data: [{ value: '64', value_classification: 'Greed' }] };
+  if (url.includes('alternative.me')) return { data: fngHistory };
   if (url.includes('klines')) {
-    const closes = url.includes('interval=1h') ? hourly : daily;
+    const limit = Number(/limit=(\d+)/.exec(url)![1]);
+    const base = url.includes('ETHUSDT') ? 3500 : 70000;
+    const closes = url.includes('interval=1h') ? hourly : dailyOf(limit, base);
     return closes.map((c) => [0, 0, 0, 0, String(c)]);
   }
   if (url.includes('ticker/24hr')) return { priceChangePercent: '1.5', lastPrice: '70000' };
@@ -116,4 +119,42 @@ test('cache: una sola serie di chiamate per finestra di TTL; se tutto fallisce s
   assert.equal(old.stale, true);
   assert.equal(old.coverage.available, 6);
   resetCache();
+});
+
+test('storico: 90 giorni ricostruiti, confrontabili con oggi, valori in 0..100', () => {
+  const btc = dailyOf(120, 70000);
+  const eth = dailyOf(100, 3500);
+  const fng = fngHistory.map((x) => Number(x.value));
+  const series = buildHistory(btc, eth, fng);
+  assert.equal(series.length, 90);
+  assert.ok(series.every((v) => v >= 0 && v <= 100));
+});
+
+test('storico: senza serie disponibili non produce nulla (niente dati inventati)', () => {
+  assert.equal(buildHistory(null, null, null).length, 0);
+  assert.equal(computeContext([]), null);
+  assert.equal(computeContext(Array(10).fill(50)), null); // troppo corto
+});
+
+test('contesto: percentile e zone', () => {
+  const base = Array.from({ length: 89 }, (_, i) => 40 + (i % 20)); // 40..59
+  const high = computeContext([...base, 90])!;
+  assert.equal(high.percentile, 100);
+  assert.equal(high.zone, 'high');
+  assert.equal(high.max, 90);
+  const low = computeContext([...base, 10])!;
+  assert.equal(low.percentile, 0);
+  assert.equal(low.zone, 'low');
+  const mid = computeContext([...base, 50])!;
+  assert.equal(mid.zone, null);
+  assert.ok(mid.percentile > 30 && mid.percentile < 70);
+});
+
+test('snapshot include il contesto e lo conserva se la fonte cade (carry-over)', async () => {
+  const good = await buildSnapshot(mockFetch());
+  assert.ok(good.context && good.context.days === 90);
+  const bad = await buildSnapshot(mockFetch(['binance', 'coinbase', 'alternative']));
+  assert.equal(bad.context, null);
+  const merged = mergeWithPrevious(bad, good);
+  assert.equal(merged.context, good.context);
 });

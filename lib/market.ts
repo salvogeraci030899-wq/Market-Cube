@@ -14,6 +14,21 @@ export interface Metric {
   stale?: boolean;
 }
 
+export interface Context {
+  /** giorni dell'indice storico (compreso oggi) */
+  days: number;
+  /** valore di oggi, calcolato con le stesse metriche dello storico (quindi confrontabile) */
+  today: number;
+  /** quota di giorni passati con valore più basso di oggi, 0..100 */
+  percentile: number;
+  min: number;
+  max: number;
+  /** indice storico giorno per giorno, dal più vecchio a oggi */
+  series: number[];
+  /** 'high'/'low' se oggi è tra il 10% più alto/basso degli ultimi giorni */
+  zone: 'high' | 'low' | null;
+}
+
 export interface Snapshot {
   /** null se i dati disponibili sono troppo pochi per un giudizio sensato */
   sentiment: number | null;
@@ -26,6 +41,8 @@ export interface Snapshot {
     stale?: boolean;
   };
   dominance: number | null;
+  /** confronto di oggi con gli ultimi 90 giorni; null se lo storico non è disponibile */
+  context: Context | null;
   coverage: { available: number; total: number };
   metrics: Metric[];
   sources: Record<string, boolean>;
@@ -121,11 +138,13 @@ async function fetchGlobalDominance(f: Fetcher): Promise<number> {
   return v;
 }
 
-async function fetchFng(f: Fetcher): Promise<{ value: number; label: string }> {
-  const d = await getJson('https://api.alternative.me/fng/?limit=1&format=json', f);
+async function fetchFng(f: Fetcher): Promise<{ value: number; label: string; history: number[] }> {
+  const d = await getJson('https://api.alternative.me/fng/?limit=90&format=json', f);
   const v = Number(d?.data?.[0]?.value);
   if (!Number.isFinite(v)) throw new Error('fear & greed assente');
-  return { value: v, label: String(d.data[0].value_classification ?? '') };
+  const history = (d.data as any[]).map((x) => Number(x?.value)).filter((n) => Number.isFinite(n));
+  // history[0] = oggi, poi i giorni precedenti
+  return { value: v, label: String(d.data[0].value_classification ?? ''), history };
 }
 
 /** Variazione 24h + prezzo da un exchange (fallback per BTC/ETH se CoinGecko è irraggiungibile). */
@@ -151,10 +170,10 @@ async function fetchTicker(base: 'BTC' | 'ETH', f: Fetcher): Promise<{ change: n
   });
 }
 
-/** Chiusure BTC, dalla più vecchia alla più recente. */
-async function fetchCloses(interval: '1h' | '1d', limit: number, f: Fetcher): Promise<number[]> {
+/** Chiusure di BTC o ETH, dalla più vecchia alla più recente. */
+async function fetchCloses(base: 'BTC' | 'ETH', interval: '1h' | '1d', limit: number, f: Fetcher): Promise<number[]> {
   const fromBinance = (host: string) => async () => {
-    const rows: any[] = await getJson(`https://${host}/api/v3/klines?symbol=BTCUSDT&interval=${interval}&limit=${limit}`, f);
+    const rows: any[] = await getJson(`https://${host}/api/v3/klines?symbol=${base}USDT&interval=${interval}&limit=${limit}`, f);
     return rows.map((r) => Number(r[4]));
   };
   const closes = await firstOf<number[]>([
@@ -162,7 +181,7 @@ async function fetchCloses(interval: '1h' | '1d', limit: number, f: Fetcher): Pr
     fromBinance('data-api.binance.vision'),
     async () => {
       const g = interval === '1h' ? 3600 : 86400;
-      const rows: any[] = await getJson(`https://api.exchange.coinbase.com/products/BTC-USD/candles?granularity=${g}`, f);
+      const rows: any[] = await getJson(`https://api.exchange.coinbase.com/products/${base}-USD/candles?granularity=${g}`, f);
       // [time, low, high, open, close, volume], dal più recente
       return rows
         .slice()
@@ -171,7 +190,7 @@ async function fetchCloses(interval: '1h' | '1d', limit: number, f: Fetcher): Pr
         .map((r) => Number(r[4]));
     },
   ]);
-  if (closes.length < Math.min(limit, 25) || closes.some((c) => !Number.isFinite(c) || c <= 0)) {
+  if (closes.length < Math.min(limit, 30) || closes.some((c) => !Number.isFinite(c) || c <= 0)) {
     throw new Error('candele insufficienti');
   }
   return closes;
@@ -207,6 +226,56 @@ export function realizedVolAnnualizedPct(closes: number[]): number {
   const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
   const variance = rets.reduce((a, b) => a + (b - mean) ** 2, 0) / (rets.length - 1);
   return Math.sqrt(variance) * Math.sqrt(24 * 365) * 100;
+}
+
+export const HISTORY_DAYS = 90;
+const avg = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+
+/**
+ * Ricostruisce l'indice di sentiment giorno per giorno con le metriche che hanno uno storico pubblico
+ * gratuito: momentum BTC, momentum ETH, trend BTC vs media 30g, Fear & Greed.
+ * (Funding e ampiezza non hanno storico gratuito e restano fuori da questo confronto.)
+ * btc/eth: chiusure giornaliere dalla più vecchia alla più recente; fng: valori dal più recente (oggi) indietro.
+ */
+export function buildHistory(btc: number[] | null, eth: number[] | null, fng: number[] | null, days = HISTORY_DAYS): number[] {
+  const out: number[] = [];
+  for (let k = days - 1; k >= 0; k--) {
+    const ms: Metric[] = [];
+    const add = (id: MetricId, score: number) => {
+      if (Number.isFinite(score)) ms.push({ id, label: id, score, value: '', detail: '' });
+    };
+    if (btc) {
+      const i = btc.length - 1 - k;
+      if (i >= 1) add('btc', scoreMomentum((btc[i] / btc[i - 1] - 1) * 100));
+      if (i >= 29) add('trend', scoreTrend(btc[i], avg(btc.slice(i - 29, i + 1))));
+    }
+    if (eth) {
+      const i = eth.length - 1 - k;
+      if (i >= 1) add('eth', scoreMomentum((eth[i] / eth[i - 1] - 1) * 100));
+    }
+    if (fng && k < fng.length) add('fng', clamp(fng[k]));
+    const v = aggregate(ms);
+    if (v !== null) out.push(v);
+  }
+  return out;
+}
+
+export function computeContext(series: number[]): Context | null {
+  if (series.length < 30) return null;
+  const today = series[series.length - 1];
+  const past = series.slice(0, -1);
+  const below = past.filter((v) => v < today).length;
+  const equal = past.filter((v) => v === today).length;
+  const percentile = ((below + equal / 2) / past.length) * 100;
+  return {
+    days: series.length,
+    today,
+    percentile,
+    min: Math.min(...series),
+    max: Math.max(...series),
+    series,
+    zone: percentile >= 90 ? 'high' : percentile <= 10 ? 'low' : null,
+  };
 }
 
 export function regimeFor(sentiment: number | null, volIndex: number | null): string {
@@ -246,12 +315,13 @@ async function settle<T>(p: Promise<T>): Promise<Settled<T>> {
 const empty = (id: MetricId, label: string): Metric => ({ id, label, score: null, value: 'n/d', detail: 'fonte non raggiungibile' });
 
 export async function buildSnapshot(f: Fetcher = fetch): Promise<Snapshot> {
-  const [markets, dominance, fng, daily, hourly, funding, btcT, ethT] = await Promise.all([
+  const [markets, dominance, fng, daily, ethDaily, hourly, funding, btcT, ethT] = await Promise.all([
     settle(fetchMarkets(f)),
     settle(fetchGlobalDominance(f)),
     settle(fetchFng(f)),
-    settle(fetchCloses('1d', 30, f)),
-    settle(fetchCloses('1h', 49, f)),
+    settle(fetchCloses('BTC', '1d', HISTORY_DAYS + 30, f)),
+    settle(fetchCloses('ETH', '1d', HISTORY_DAYS + 10, f)),
+    settle(fetchCloses('BTC', '1h', 49, f)),
     settle(fetchFunding(f)),
     settle(fetchTicker('BTC', f)),
     settle(fetchTicker('ETH', f)),
@@ -276,9 +346,9 @@ export async function buildSnapshot(f: Fetcher = fetch): Promise<Snapshot> {
           ? { id, label: 'Fear & Greed', score: clamp(fng.v.value), value: String(fng.v.value), detail: fng.v.label }
           : empty(id, 'Fear & Greed');
       case 'trend': {
-        if (!daily.ok) return empty(id, 'Trend 30g');
+        if (!daily.ok || daily.v.length < 30) return empty(id, 'Trend 30g');
         const last = daily.v[daily.v.length - 1];
-        const sma = daily.v.reduce((a, b) => a + b, 0) / daily.v.length;
+        const sma = avg(daily.v.slice(-30));
         const dev = (last / sma - 1) * 100;
         return { id, label: 'Trend 30g', score: scoreTrend(last, sma), value: fmtPct(dev), detail: 'BTC vs media 30 giorni' };
       }
@@ -305,9 +375,13 @@ export async function buildSnapshot(f: Fetcher = fetch): Promise<Snapshot> {
     if (Number.isFinite(v)) annualizedPct = v;
   }
 
+  const context = computeContext(
+    buildHistory(daily.ok ? daily.v : null, ethDaily.ok ? ethDaily.v : null, fng.ok ? fng.v.history : null),
+  );
+
   const sources: Record<string, boolean> = {
     'CoinGecko': markets.ok || dominance.ok,
-    'Exchange (Binance/Coinbase)': daily.ok || hourly.ok || btcT.ok || ethT.ok,
+    'Exchange (Binance/Coinbase)': daily.ok || ethDaily.ok || hourly.ok || btcT.ok || ethT.ok,
     'Fear & Greed': fng.ok,
     'Funding (OKX/Bybit)': funding.ok,
   };
@@ -316,6 +390,7 @@ export async function buildSnapshot(f: Fetcher = fetch): Promise<Snapshot> {
     metrics,
     annualizedPct,
     dominance: dominance.ok ? dominance.v : null,
+    context,
     sources,
     fetchedAt: Date.now(),
     stale: false,
@@ -326,6 +401,7 @@ interface Raw {
   metrics: Metric[];
   annualizedPct: number | null;
   dominance: number | null;
+  context: Context | null;
   sources: Record<string, boolean>;
   fetchedAt: number;
   stale: boolean;
@@ -341,6 +417,7 @@ function finalize(raw: Raw): Snapshot {
     regime: regimeFor(sentiment, index),
     volatility: { annualizedPct: raw.annualizedPct, index, ...(raw.volStale ? { stale: true } : {}) },
     dominance: raw.dominance,
+    context: raw.context,
     coverage: { available, total: raw.metrics.length },
     metrics: raw.metrics,
     sources: raw.sources,
@@ -370,6 +447,7 @@ export function mergeWithPrevious(next: Snapshot, prev: Snapshot | null, now = D
     metrics,
     annualizedPct,
     dominance: next.dominance ?? prev.dominance,
+    context: next.context ?? prev.context,
     sources: next.sources,
     fetchedAt: next.fetchedAt,
     stale: false,

@@ -10,7 +10,8 @@
   padding: 18px 24px 16px;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   box-sizing: border-box;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .header {
@@ -155,7 +156,6 @@
 .score small { font-size: 0.95rem; font-weight: 400; opacity: 0.5; margin-left: 2px; }
 .summaryText { flex: 1; min-width: 120px; }
 .regime { font-size: 1.05rem; font-weight: 600; letter-spacing: 2px; }
-.spark { min-width: 120px; }
 
 .metrics {
   list-style: none;
@@ -285,4 +285,49 @@
 
 @media (prefers-reduced-motion: reduce) {
   .face, .barFill, .score { transition: none; }
+}
+
+/* ---------- storico 90 giorni ---------- */
+.history {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 10px 12px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.historyZone { border-color: var(--glow, rgba(255, 255, 255, 0.4)); }
+.historyHead { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.historyTitle { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 1px; color: rgba(255, 255, 255, 0.7); }
+.historyNote { margin-left: auto; font-size: 0.72rem; color: rgba(255, 255, 255, 0.55); }
+.historyText { font-size: 0.78rem; color: rgba(255, 255, 255, 0.7); }
+.chart { width: 100%; height: 52px; display: block; }
+
+.pillHigh, .pillLow {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 1px;
+  padding: 2px 9px;
+  border-radius: 999px;
+}
+.pillHigh { background: rgba(0, 255, 136, 0.18); color: #00ff88; }
+.pillLow { background: rgba(255, 70, 90, 0.2); color: #ff6b7d; }
+
+.buttonGhost {
+  background: transparent;
+  border-color: rgba(255, 255, 255, 0.25);
+  color: rgba(255, 255, 255, 0.8);
+}
+.buttonGhost:hover:not(:disabled) { background: rgba(255, 255, 255, 0.1); }
+.warningInline { margin: 0; font-size: 0.74rem; color: #ffb24d; }
+
+/* ---------- alone sul cubo quando il sentiment è in zona estrema ---------- */
+.zoneGlow { animation: glow 2.6s ease-in-out infinite; }
+@keyframes glow {
+  0%, 100% { filter: drop-shadow(0 0 12px var(--glow)); }
+  50% { filter: drop-shadow(0 0 46px var(--glow)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .zoneGlow { animation: none; filter: drop-shadow(0 0 30px var(--glow)); }
 }

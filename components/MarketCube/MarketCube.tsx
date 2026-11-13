@@ -6,7 +6,6 @@ import { NO_DATA_COLOR, scoreLabel, scoreToColor } from '@/lib/palette';
 import { getSnapshot, type MetricId, type Snapshot } from '@/lib/market';
 
 const REFRESH_MS = 60_000;
-const HISTORY_MAX = 90;
 const IDLE_RESUME_MS = 6000;
 
 // Quale metrica sta su quale faccia, e come ruotare il cubo per portarla di fronte.
@@ -21,17 +20,28 @@ const FACES: Array<{ id: MetricId; cls: string; view: { rx: number; ry: number }
 
 const shortestDelta = (from: number, to: number) => ((((to - from) % 360) + 540) % 360) - 180;
 
-function Sparkline({ values }: { values: number[] }) {
-  if (values.length < 2) return <span className={styles.muted}>raccolta storico…</span>;
-  const w = 120;
-  const h = 28;
-  const pts = values
-    .map((v, i) => `${((i / (values.length - 1)) * w).toFixed(1)},${(h - (v / 100) * h).toFixed(1)}`)
-    .join(' ');
+function HistoryChart({ series }: { series: number[] }) {
+  const w = 540;
+  const h = 52;
+  const x = (i: number) => (i / (series.length - 1)) * w;
+  // scala adattata all'intervallo reale dei dati, così le variazioni restano leggibili
+  const lo = Math.max(0, Math.min(...series) - 4);
+  const hi = Math.min(100, Math.max(...series) + 4);
+  const y = (v: number) => h - 4 - ((v - lo) / Math.max(1, hi - lo)) * (h - 8);
+  const pts = series.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  const last = series[series.length - 1];
+  const sorted = [...series].sort((a, b) => a - b);
+  const p10 = sorted[Math.floor(sorted.length * 0.1)];
+  const p90 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.9))];
   return (
-    <svg width={w} height={h} viewBox={`0 0 ${w} ${h}`} aria-label="Andamento del sentiment in questa sessione">
-      <line x1="0" x2={w} y1={h / 2} y2={h / 2} stroke="rgba(255,255,255,0.15)" strokeDasharray="2 3" />
-      <polyline points={pts} fill="none" stroke="rgba(255,255,255,0.85)" strokeWidth="1.5" />
+    <svg className={styles.chart} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none" role="img"
+         aria-label="Indice di sentiment degli ultimi 90 giorni">
+      <rect x="0" y={0} width={w} height={Math.max(0, y(p90))} fill="rgba(0,255,136,0.07)" />
+      <rect x="0" y={y(p10)} width={w} height={Math.max(0, h - y(p10))} fill="rgba(220,20,60,0.09)" />
+      <line x1="0" x2={w} y1={y(p90)} y2={y(p90)} stroke="rgba(0,255,136,0.3)" strokeDasharray="3 4" vectorEffect="non-scaling-stroke" />
+      <line x1="0" x2={w} y1={y(p10)} y2={y(p10)} stroke="rgba(255,90,90,0.3)" strokeDasharray="3 4" vectorEffect="non-scaling-stroke" />
+      <polyline points={pts} fill="none" stroke="rgba(255,255,255,0.85)" strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
+      <circle cx={x(series.length - 1)} cy={y(last)} r="4.5" fill={scoreToColor(last)} stroke="#fff" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
     </svg>
   );
 }
@@ -41,7 +51,6 @@ export default function MarketCube() {
   const [data, setData] = useState<Snapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [history, setHistory] = useState<number[]>([]);
   const [now, setNow] = useState(() => Date.now());
 
   const dataRef = useRef<Snapshot | null>(null);
@@ -49,7 +58,6 @@ export default function MarketCube() {
 
   // ---- caricamento dati: direttamente dal browser verso le API pubbliche (nessun server, nessun dato inventato)
   const reqId = useRef(0);
-  const lastPoint = useRef(0);
   const load = useCallback(async (force = false) => {
     const id = ++reqId.current;
     setLoading(true);
@@ -58,10 +66,6 @@ export default function MarketCube() {
       if (id !== reqId.current) return; // risposta superata da una richiesta più recente
       setData(snap);
       setError(null);
-      if (snap.sentiment !== null && !snap.stale && snap.fetchedAt !== lastPoint.current) {
-        lastPoint.current = snap.fetchedAt;
-        setHistory((h) => [...h, snap.sentiment as number].slice(-HISTORY_MAX));
-      }
     } catch (e) {
       if (id === reqId.current) setError(e instanceof Error ? e.message : 'Errore di rete');
     } finally {
@@ -86,6 +90,62 @@ export default function MarketCube() {
       document.removeEventListener('visibilitychange', onVisible);
     };
   }, [load]);
+
+  // ---- zona estrema, titolo della scheda e avvisi del browser
+  const zone = data?.context?.zone ?? null;
+  const [alertsOn, setAlertsOn] = useState(false);
+  const [alertsSupported, setAlertsSupported] = useState(false);
+  const [alertMsg, setAlertMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    try {
+      const ok = typeof Notification !== 'undefined';
+      setAlertsSupported(ok);
+      setAlertsOn(ok && localStorage.getItem('mc_alerts') === '1' && Notification.permission === 'granted');
+    } catch {
+      /* storage non disponibile: gli avvisi restano spenti */
+    }
+  }, []);
+
+  const toggleAlerts = async () => {
+    setAlertMsg(null);
+    if (alertsOn) {
+      setAlertsOn(false);
+      try { localStorage.setItem('mc_alerts', '0'); } catch { /* ignora */ }
+      return;
+    }
+    try {
+      const perm = await Notification.requestPermission();
+      if (perm === 'granted') {
+        setAlertsOn(true);
+        try { localStorage.setItem('mc_alerts', '1'); } catch { /* ignora */ }
+      } else {
+        setAlertMsg('Il browser ha negato il permesso per le notifiche.');
+      }
+    } catch {
+      setAlertMsg('Notifiche non supportate da questo browser.');
+    }
+  };
+
+  useEffect(() => {
+    if (!data) return;
+    const score = data.sentiment === null ? '—' : Math.round(data.sentiment);
+    document.title = `${score}${zone === 'high' ? ' ▲' : zone === 'low' ? ' ▼' : ''} · Market Cube`;
+
+    // avvisa solo al cambio di zona (anche tra un ricaricamento e l'altro), mai a ogni aggiornamento
+    const cur = zone ?? 'none';
+    let last: string | null = null;
+    try { last = localStorage.getItem('mc_zone'); } catch { /* ignora */ }
+    if (cur === last) return;
+    try { localStorage.setItem('mc_zone', cur); } catch { /* ignora */ }
+    const ctx = data.context;
+    if (zone && ctx && alertsOn && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      const pct = Math.round(zone === 'high' ? ctx.percentile : 100 - ctx.percentile);
+      new Notification(zone === 'high' ? 'Market Cube: zona alta' : 'Market Cube: zona bassa', {
+        body: `Il sentiment è ${zone === 'high' ? 'più alto' : 'più basso'} del ${pct}% degli ultimi ${ctx.days - 1} giorni (oggi ${ctx.today.toFixed(0)}).`,
+      });
+    }
+  }, [data, zone, alertsOn]);
 
   // ---- animazione del cubo
   const vol = data?.volatility.index ?? 1;
@@ -229,7 +289,8 @@ export default function MarketCube() {
       <div className={styles.layout}>
         <section className={styles.stage} aria-label="Cubo 3D del sentiment: trascina per ruotarlo">
           <div
-            className={styles.scene}
+            className={`${styles.scene} ${zone ? styles.zoneGlow : ''}`}
+            style={{ ['--glow' as string]: headColor }}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={endDrag}
@@ -269,12 +330,39 @@ export default function MarketCube() {
             </div>
             <div className={styles.summaryText}>
               <div className={styles.regime}>{data.regime}</div>
-              <div className={styles.muted}>{sentiment === null ? 'servono almeno 3 fonti' : scoreLabel(sentiment)}</div>
-            </div>
-            <div className={styles.spark}>
-              <Sparkline values={history} />
+              {sentiment === null ? (
+                <div className={styles.muted}>servono almeno 3 fonti</div>
+              ) : (
+                scoreLabel(sentiment) !== data.regime && <div className={styles.muted}>{scoreLabel(sentiment)}</div>
+              )}
             </div>
           </div>
+
+          {data.context ? (
+            <div className={`${styles.history} ${zone ? styles.historyZone : ''}`}>
+              <div className={styles.historyHead}>
+                <span className={styles.historyTitle}>Ultimi {data.context.days} giorni</span>
+                {zone && (
+                  <span className={zone === 'high' ? styles.pillHigh : styles.pillLow}>
+                    {zone === 'high' ? '▲ ZONA ALTA' : '▼ ZONA BASSA'}
+                  </span>
+                )}
+                <span className={styles.historyNote}>
+                  oggi {data.context.today.toFixed(0)} · min {data.context.min.toFixed(0)} · max {data.context.max.toFixed(0)}
+                </span>
+              </div>
+              <HistoryChart series={data.context.series} />
+              <div className={styles.historyText}>
+                Oggi è {data.context.percentile >= 50 ? 'più alto' : 'più basso'} del{' '}
+                <b>{Math.round(data.context.percentile >= 50 ? data.context.percentile : 100 - data.context.percentile)}%</b>{' '}
+                degli ultimi {data.context.days - 1} giorni.
+              </div>
+            </div>
+          ) : (
+            <div className={styles.history}>
+              <span className={styles.muted}>Storico a 90 giorni non disponibile (fonti non raggiungibili).</span>
+            </div>
+          )}
 
           <ul className={styles.metrics}>
             {data.metrics.map((m) => (
@@ -332,13 +420,24 @@ export default function MarketCube() {
                 </span>
               ))}
             </span>
+            {alertsSupported && (
+              <button
+                className={`${styles.button} ${styles.buttonGhost}`}
+                onClick={toggleAlerts}
+                title="Notifica del browser quando il sentiment entra in zona alta o bassa (funziona finché la scheda resta aperta)"
+              >
+                {alertsOn ? '🔔 Avvisi attivi' : '🔕 Avvisi spenti'}
+              </button>
+            )}
             <span className={styles.muted}>Aggiornato {age}</span>
             <button className={styles.button} onClick={() => load(true)} disabled={loading}>
               {loading ? 'Aggiorno…' : 'Aggiorna'}
             </button>
           </div>
+          {alertMsg && <p className={styles.warningInline}>{alertMsg}</p>}
           <p className={styles.disclaimer}>
-            Indicatore informativo, non è un consiglio finanziario. Ogni faccia è un punteggio 0–100 (rosso = panico, viola =
+            Lo storico usa BTC, ETH, trend 30g e Fear &amp; Greed (funding e ampiezza non hanno storico gratuito). Zona alta/bassa =
+            tra il 10% più alto/basso degli ultimi 90 giorni. Indicatore informativo, non è un consiglio finanziario. Ogni faccia è un punteggio 0–100 (rosso = panico, viola =
             neutro, verde = euforia); il totale è la media pesata delle sole metriche disponibili.
           </p>
         </section>
