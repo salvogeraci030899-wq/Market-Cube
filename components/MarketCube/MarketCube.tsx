@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import styles from './MarketCube.module.css';
 import { NO_DATA_COLOR, scoreLabel, scoreToColor } from '@/lib/palette';
-import type { MetricId, Snapshot } from '@/lib/market';
+import { getSnapshot, type MetricId, type Snapshot } from '@/lib/market';
 
 const REFRESH_MS = 60_000;
 const HISTORY_MAX = 90;
@@ -11,10 +11,10 @@ const IDLE_RESUME_MS = 6000;
 
 // Quale metrica sta su quale faccia, e come ruotare il cubo per portarla di fronte.
 const FACES: Array<{ id: MetricId; cls: string; view: { rx: number; ry: number } }> = [
-  { id: 'btc', cls: 'front', view: { rx: 12, ry: 0 } },
-  { id: 'eth', cls: 'back', view: { rx: 12, ry: 180 } },
-  { id: 'fng', cls: 'right', view: { rx: 12, ry: -90 } },
-  { id: 'trend', cls: 'left', view: { rx: 12, ry: 90 } },
+  { id: 'btc', cls: 'front', view: { rx: -18, ry: 0 } },
+  { id: 'eth', cls: 'back', view: { rx: -18, ry: 180 } },
+  { id: 'fng', cls: 'right', view: { rx: -18, ry: -90 } },
+  { id: 'trend', cls: 'left', view: { rx: -18, ry: 90 } },
   { id: 'breadth', cls: 'top', view: { rx: -80, ry: 0 } },
   { id: 'funding', cls: 'bottom', view: { rx: 80, ry: 0 } },
 ];
@@ -47,27 +47,25 @@ export default function MarketCube() {
   const dataRef = useRef<Snapshot | null>(null);
   dataRef.current = data;
 
-  // ---- caricamento dati (solo dal nostro endpoint; nessun fallback inventato)
-  const inflight = useRef<AbortController | null>(null);
-  const load = useCallback(async () => {
-    inflight.current?.abort();
-    const ctrl = new AbortController();
-    inflight.current = ctrl;
+  // ---- caricamento dati: direttamente dal browser verso le API pubbliche (nessun server, nessun dato inventato)
+  const reqId = useRef(0);
+  const lastPoint = useRef(0);
+  const load = useCallback(async (force = false) => {
+    const id = ++reqId.current;
     setLoading(true);
     try {
-      const res = await fetch('/api/market-data', { signal: ctrl.signal, cache: 'no-store' });
-      if (!res.ok) throw new Error(`Errore server (${res.status})`);
-      const snap: Snapshot = await res.json();
+      const snap = await getSnapshot(force ? 0 : 30_000);
+      if (id !== reqId.current) return; // risposta superata da una richiesta più recente
       setData(snap);
       setError(null);
-      if (snap.sentiment !== null && !snap.stale) {
+      if (snap.sentiment !== null && !snap.stale && snap.fetchedAt !== lastPoint.current) {
+        lastPoint.current = snap.fetchedAt;
         setHistory((h) => [...h, snap.sentiment as number].slice(-HISTORY_MAX));
       }
     } catch (e) {
-      if ((e as Error).name === 'AbortError') return;
-      setError(e instanceof Error ? e.message : 'Errore di rete');
+      if (id === reqId.current) setError(e instanceof Error ? e.message : 'Errore di rete');
     } finally {
-      if (inflight.current === ctrl) setLoading(false);
+      if (id === reqId.current) setLoading(false);
     }
   }, []);
 
@@ -86,7 +84,6 @@ export default function MarketCube() {
       clearInterval(poll);
       clearInterval(tick);
       document.removeEventListener('visibilitychange', onVisible);
-      inflight.current?.abort();
     };
   }, [load]);
 
@@ -96,7 +93,7 @@ export default function MarketCube() {
   const motion = useRef({ vol: 1, coverage: 1 });
   motion.current = { vol, coverage };
 
-  const rot = useRef({ rx: 12, ry: -25 });
+  const rot = useRef({ rx: -18, ry: -25 });
   const focus = useRef<{ rx: number; ry: number } | null>(null);
   const drag = useRef<{ x: number; y: number; id: number } | null>(null);
   const lastInteraction = useRef(0);
@@ -127,9 +124,9 @@ export default function MarketCube() {
             setActiveFace(null);
           }
         } else {
-          const speed = reduce ? 4 : 6 + v * 8; // gradi/secondo: più volatilità = più veloce
+          const speed = 20 + v * 14; // gradi/secondo: più volatilità = più veloce
           r.ry = (r.ry + (speed * dt) / 1000) % 360;
-          r.rx += (12 - r.rx) * Math.min(1, dt * 0.004);
+          r.rx += (-18 - r.rx) * Math.min(1, dt * 0.004);
         }
       }
 
@@ -137,7 +134,7 @@ export default function MarketCube() {
       let jx = 0;
       let jy = 0;
       if (!reduce) {
-        wobble = Math.sin(t * 0.0012) * (1 + v) * 1.2;
+        wobble = Math.sin(t * 0.0012) * (1 + v) * 2.5;
         if (v >= 2) {
           jx = Math.sin(t * 0.021) * 1.2;
           jy = Math.cos(t * 0.017) * 1.2;
@@ -191,7 +188,7 @@ export default function MarketCube() {
           <>
             <h2>Dati non raggiungibili</h2>
             <p className={styles.muted}>{error}</p>
-            <button className={styles.button} onClick={load}>
+            <button className={styles.button} onClick={() => load(true)}>
               Riprova
             </button>
           </>
@@ -216,8 +213,8 @@ export default function MarketCube() {
     <main className={styles.container}>
       <header className={styles.header}>
         <h1 className={styles.title}>MARKET CUBE</h1>
-        <span className={`${styles.badge} ${outdated ? styles.badgeStale : ''}`}>
-          {outdated ? 'DATI VECCHI' : 'LIVE'}
+        <span className={`${styles.badge} ${outdated || data.coverage.available === 0 ? styles.badgeStale : ''}`}>
+          {data.coverage.available === 0 ? 'NESSUN DATO' : outdated ? 'DATI VECCHI' : 'LIVE'}
         </span>
       </header>
 
@@ -229,111 +226,123 @@ export default function MarketCube() {
         </div>
       )}
 
-      <section className={styles.stage} aria-label="Cubo 3D del sentiment: trascina per ruotarlo">
-        <div
-          className={styles.scene}
-          onPointerDown={onPointerDown}
-          onPointerMove={onPointerMove}
-          onPointerUp={endDrag}
-          onPointerCancel={endDrag}
-        >
-          <div className={styles.cube} ref={cubeRef}>
-            {FACES.map(({ id, cls }) => {
-              const m = byId.get(id);
-              const score = m?.score ?? null;
-              const color = score === null ? NO_DATA_COLOR(0.55) : scoreToColor(score, 0.78);
-              const strong = score !== null && (score > 80 || score < 20);
-              return (
-                <div
-                  key={id}
-                  className={`${styles.face} ${styles[cls]} ${activeFace === id ? styles.faceActive : ''}`}
-                  style={{
-                    backgroundColor: color,
-                    boxShadow: strong ? `inset 0 0 40px ${scoreToColor(score as number, 0.9)}` : undefined,
-                  }}
-                >
-                  <span className={styles.faceLabel}>{m?.label ?? id}</span>
-                  <span className={styles.faceValue}>{m?.value ?? 'n/d'}</span>
-                  {m?.stale && <span className={styles.faceStale}>dato precedente</span>}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-        <p className={styles.hint}>Trascina per ruotare · clicca una metrica per vederla sul cubo</p>
-      </section>
-
-      <section className={styles.panel}>
-        <div className={styles.summary}>
-          <div className={styles.score} style={{ color: headColor }}>
-            {sentiment === null ? '—' : sentiment.toFixed(0)}
-            <small>/100</small>
-          </div>
-          <div>
-            <div className={styles.regime}>{data.regime}</div>
-            <div className={styles.muted}>{sentiment === null ? 'servono almeno 3 fonti' : scoreLabel(sentiment)}</div>
-          </div>
-          <div className={styles.spark}>
-            <Sparkline values={history} />
-          </div>
-        </div>
-
-        <ul className={styles.metrics}>
-          {data.metrics.map((m) => (
-            <li key={m.id}>
-              <button
-                className={`${styles.metric} ${activeFace === m.id ? styles.metricActive : ''}`}
-                onClick={() => showFace(m.id)}
-              >
-                <span className={styles.metricName}>{m.label}</span>
-                <span className={styles.metricValue}>{m.value}</span>
-                <span className={styles.bar}>
-                  <span
-                    className={styles.barFill}
+      <div className={styles.layout}>
+        <section className={styles.stage} aria-label="Cubo 3D del sentiment: trascina per ruotarlo">
+          <div
+            className={styles.scene}
+            onPointerDown={onPointerDown}
+            onPointerMove={onPointerMove}
+            onPointerUp={endDrag}
+            onPointerCancel={endDrag}
+          >
+            <div className={styles.cube} ref={cubeRef}>
+              {FACES.map(({ id, cls }) => {
+                const m = byId.get(id);
+                const score = m?.score ?? null;
+                const color = score === null ? NO_DATA_COLOR(1) : scoreToColor(score, 1);
+                const strong = score !== null && (score > 80 || score < 20);
+                return (
+                  <div
+                    key={id}
+                    className={`${styles.face} ${styles[cls]} ${activeFace === id ? styles.faceActive : ''}`}
                     style={{
-                      width: `${m.score ?? 0}%`,
-                      background: m.score === null ? 'transparent' : scoreToColor(m.score),
-                      opacity: m.stale ? 0.45 : 1,
+                      backgroundColor: color,
+                      boxShadow: strong ? `0 0 38px ${scoreToColor(score as number, 0.8)}` : undefined,
                     }}
-                  />
-                </span>
-                <span className={styles.metricDetail}>{m.stale ? `${m.detail} · precedente` : m.detail}</span>
-              </button>
-            </li>
-          ))}
-        </ul>
+                  >
+                    <span className={styles.faceLabel}>{m?.label ?? id}</span>
+                    <span className={styles.faceValue}>{m?.value ?? 'n/d'}</span>
+                    {m?.stale && <span className={styles.faceStale}>dato precedente</span>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          <p className={styles.hint}>Trascina per ruotare · clicca una metrica per vederla sul cubo</p>
+        </section>
 
-        <div className={styles.footer}>
-          <span title="Volatilità realizzata BTC sulle ultime 24h, annualizzata. Il cubo ruota più veloce e vibra quando è alta (2x = 100%).">
-            Volatilità:{' '}
-            {data.volatility.annualizedPct === null
-              ? 'n/d'
-              : `${data.volatility.annualizedPct.toFixed(0)}% ann. (${(data.volatility.index ?? 1).toFixed(1)}x)`}
-            {data.volatility.stale ? ' · precedente' : ''}
-          </span>
-          <span>Dominance BTC: {data.dominance === null ? 'n/d' : `${data.dominance.toFixed(1)}%`}</span>
-          <span>
-            Copertura: {data.coverage.available}/{data.coverage.total}
-          </span>
-          <span>
-            Fonti:{' '}
-            {Object.entries(data.sources).map(([name, ok], i) => (
-              <span key={name}>
-                {i > 0 && ' · '}
-                <span className={ok ? styles.online : styles.offline}>{name}</span>
-              </span>
+        <section className={styles.panel}>
+          <div className={styles.summary}>
+            <div className={styles.score} style={{ color: headColor }}>
+              {sentiment === null ? '—' : sentiment.toFixed(0)}
+              <small>/100</small>
+            </div>
+            <div className={styles.summaryText}>
+              <div className={styles.regime}>{data.regime}</div>
+              <div className={styles.muted}>{sentiment === null ? 'servono almeno 3 fonti' : scoreLabel(sentiment)}</div>
+            </div>
+            <div className={styles.spark}>
+              <Sparkline values={history} />
+            </div>
+          </div>
+
+          <ul className={styles.metrics}>
+            {data.metrics.map((m) => (
+              <li key={m.id}>
+                <button
+                  className={`${styles.metric} ${activeFace === m.id ? styles.metricActive : ''}`}
+                  onClick={() => showFace(m.id)}
+                >
+                  <span className={styles.metricName}>{m.label}</span>
+                  <span className={styles.metricValue}>{m.value}</span>
+                  <span className={styles.bar}>
+                    <span
+                      className={styles.barFill}
+                      style={{
+                        width: `${m.score ?? 0}%`,
+                        background: m.score === null ? 'transparent' : scoreToColor(m.score),
+                        opacity: m.stale ? 0.45 : 1,
+                      }}
+                    />
+                  </span>
+                  <span className={styles.metricDetail}>{m.stale ? `${m.detail} · precedente` : m.detail}</span>
+                </button>
+              </li>
             ))}
-          </span>
-          <span>Aggiornato {age}</span>
-          <button className={styles.button} onClick={load} disabled={loading}>
-            {loading ? 'Aggiorno…' : 'Aggiorna'}
-          </button>
-        </div>
-        <p className={styles.disclaimer}>
-          Indicatore informativo, non è un consiglio finanziario. Ogni faccia è un punteggio 0–100 (rosso = panico, viola =
-          neutro, verde = euforia); il totale è una media pesata delle sole metriche disponibili.
-        </p>
-      </section>
+          </ul>
+
+          <div className={styles.chips}>
+            <span
+              className={styles.chip}
+              title="Volatilità realizzata BTC sulle ultime 24h, annualizzata. Il cubo ruota più veloce e vibra quando è alta (2x = 100%)."
+            >
+              Volatilità{' '}
+              <b>
+                {data.volatility.annualizedPct === null
+                  ? 'n/d'
+                  : `${data.volatility.annualizedPct.toFixed(0)}% (${(data.volatility.index ?? 1).toFixed(1)}x)`}
+              </b>
+            </span>
+            <span className={styles.chip}>
+              Dominance BTC <b>{data.dominance === null ? 'n/d' : `${data.dominance.toFixed(1)}%`}</b>
+            </span>
+            <span className={styles.chip}>
+              Copertura{' '}
+              <b>
+                {data.coverage.available}/{data.coverage.total}
+              </b>
+            </span>
+          </div>
+
+          <div className={styles.footer}>
+            <span className={styles.sources}>
+              {Object.entries(data.sources).map(([name, ok]) => (
+                <span key={name} className={ok ? styles.online : styles.offline} title={ok ? 'online' : 'non raggiungibile'}>
+                  ● {name.split(' (')[0]}
+                </span>
+              ))}
+            </span>
+            <span className={styles.muted}>Aggiornato {age}</span>
+            <button className={styles.button} onClick={() => load(true)} disabled={loading}>
+              {loading ? 'Aggiorno…' : 'Aggiorna'}
+            </button>
+          </div>
+          <p className={styles.disclaimer}>
+            Indicatore informativo, non è un consiglio finanziario. Ogni faccia è un punteggio 0–100 (rosso = panico, viola =
+            neutro, verde = euforia); il totale è la media pesata delle sole metriche disponibili.
+          </p>
+        </section>
+      </div>
     </main>
   );
 }

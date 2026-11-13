@@ -16,10 +16,10 @@ Ogni faccia è una metrica con punteggio 0–100 (rosso = panico, viola = neutro
 - **Sentiment totale**: media pesata delle sole metriche disponibili (minimo 3, altrimenti "dati insufficienti").
 - **Volatilità**: volatilità realizzata di BTC sulle ultime 24h (candele orarie), annualizzata. Più è alta, più il cubo ruota veloce e vibra.
 - **Nessun dato inventato**: se una fonte non risponde la faccia diventa grigia ("n/d"); un dato recente ma non aggiornato resta al massimo 15 minuti, marcato "precedente". Se tutto è offline vedi l'ultimo snapshot con l'avviso "DATI VECCHI".
-- **Cache** lato server di 60s: aprire più schede non moltiplica le chiamate alle API gratuite.
+- **Cache** di 30s nel browser, aggiornamento automatico ogni 60s (in pausa quando la scheda è nascosta).
 - Interazione: trascina per ruotare, clicca una metrica per portarla di fronte.
 
-## Uso
+## Uso in locale
 
 ```bash
 npm install
@@ -27,7 +27,15 @@ npm run dev      # http://localhost:3000
 npm test         # test della logica dati
 ```
 
-Per l'uso quotidiano: `npm run build && npm start`. Funziona anche su Vercel (piano gratuito).
-Nota: Binance blocca gli IP USA; se ospiti dagli USA entrano in gioco in automatico Coinbase e Bybit/OKX.
+## Pubblicazione su GitHub Pages (gratis)
+
+Il sito è completamente statico: i dati vengono letti direttamente dal browser dalle API pubbliche, non serve alcun server.
+
+1. Porta il codice sul branch `main` (merge del branch di lavoro).
+2. Su GitHub: **Settings → Pages → Build and deployment → Source: GitHub Actions**.
+3. Il workflow `.github/workflows/pages.yml` parte a ogni push su `main` (o a mano da **Actions → Deploy su GitHub Pages → Run workflow**), esegue i test, costruisce il sito e lo pubblica.
+4. Il sito sarà su `https://<utente>.github.io/<nome-repo>/`.
+
+Note: i dati sono richiesti dal tuo browser, quindi se Binance è bloccato nel tuo paese entrano in automatico Coinbase e Bybit/OKX. Ogni scheda aperta aggiorna da sola ogni 60 secondi.
 
 *Indicatore informativo, non è un consiglio finanziario.*
