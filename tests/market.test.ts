@@ -1,13 +1,15 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  aggregate, buildHistory, computeContext, dailyVolAnnualizedPct, getSnapshot, realizedVolAnnualizedPct,
+  aggregate, buildHistory, computeContext, dailyVolAnnualizedPct, sigmaFromPrices, zScore, getSnapshot, realizedVolAnnualizedPct,
   regimeFor, resetCache, scoreFunding, scoreMomentum, scoreTrend, TOP_N, type Fetcher, type Metric,
 } from '../lib/market';
 
 // ---- risposte finte, nel formato reale delle API
-const pctRow = (id: string, symbol: string, price: number, c24: number, c7: number, c30: number) => ({
+const spark = (amp: number) => ({ price: Array.from({ length: 168 }, (_, i) => 100 * (1 + (i % 2 ? amp : -amp))) });
+const pctRow = (id: string, symbol: string, price: number, c24: number, c7: number, c30: number, amp = 0.002) => ({
   id, symbol, name: id.toUpperCase(), current_price: price,
+  sparkline_in_7d: spark(amp),
   price_change_percentage_24h: c24,
   price_change_percentage_24h_in_currency: c24,
   price_change_percentage_7d_in_currency: c7,
@@ -17,7 +19,7 @@ const coins = [
   pctRow('bitcoin', 'btc', 70000, 2, 5, 12),
   pctRow('ethereum', 'eth', 3500, -1, 3, 8),
   pctRow('tether', 'usdt', 1, 0.01, 0, 0),
-  pctRow('solana', 'sol', 160, 6, 10, -4),
+  pctRow('solana', 'sol', 160, 6, 10, -4, 0.01),
   ...Array.from({ length: 46 }, (_, i) => pctRow(`c${i}`, `c${i}`, 1 + i, i % 2 ? 3 : -3, 1, 1)),
 ];
 const hourly = Array.from({ length: 49 }, (_, i) => 70000 * (1 + (i % 2 ? 0.004 : -0.004)));
@@ -65,11 +67,12 @@ const snap = (id: string, down: string[] = []) => {
   return getSnapshot(id, { f: mockFetch(down), force: true });
 };
 
-test('punteggi: neutro, estremi e clamp', () => {
+test('punteggi: neutro, estremi e clamp (scala in unità di volatilità)', () => {
   assert.equal(scoreMomentum(0), 50);
   assert.equal(scoreMomentum(50), 100);
   assert.equal(scoreMomentum(-50), 0);
-  assert.equal(scoreMomentum(10, 2.5), 75);
+  assert.equal(scoreMomentum(2, 0.02), 70); // +1σ = +20 punti
+  assert.equal(scoreMomentum(-2, 0.02), 30);
   assert.equal(scoreTrend(100, 100), 50);
   assert.equal(scoreFunding(0.0001), 55);
   assert.equal(scoreFunding(-0.001), 0);
@@ -205,4 +208,32 @@ test('cache: richieste simultanee condividono i download; poi si usa la cache', 
   const extra = log.slice(after);
   assert.ok(extra.every((u) => u.includes('klines')), extra.join('\n'));
   resetCache();
+});
+
+test('confrontabilità: la stessa variazione pesa meno su una moneta più volatile', () => {
+  const calm = scoreMomentum(6, 0.02); // 3σ per una moneta tranquilla
+  const wild = scoreMomentum(6, 0.06); // 1σ per una moneta molto volatile
+  assert.ok(calm > wild + 20, `${calm} vs ${wild}`);
+  assert.equal(zScore(6, 0.06), 1);
+  // su orizzonti più lunghi la variazione "normale" cresce con la radice del tempo
+  assert.ok(scoreMomentum(10, 0.03, 7) < scoreMomentum(10, 0.03, 1));
+});
+
+test('volatilità da prezzi: serie piatta o troppo corta => nessuna stima', () => {
+  assert.equal(sigmaFromPrices(Array(168).fill(100), 24), 0.004); // limite minimo, mai zero
+  assert.equal(sigmaFromPrices([1, 2, 3], 24), undefined);
+  assert.equal(sigmaFromPrices(undefined, 24), undefined);
+  const wild = sigmaFromPrices(spark(0.01).price, 24)!;
+  const calm = sigmaFromPrices(spark(0.002).price, 24)!;
+  assert.ok(wild > calm * 3);
+});
+
+test('snapshot: SOL (volatile) e BTC (calma) con variazioni diverse ma vicine in sigma ricevono punteggi coerenti', async () => {
+  const btc = await snap('bitcoin');
+  const sol = await snap('solana');
+  const m24 = (s: typeof btc) => s.metrics.find((m) => m.id === 'm24')!;
+  // BTC +2% con σ≈0.9%: oltre 2σ -> molto alto; SOL +6% con σ≈4.8%: circa 1.2σ -> moderato
+  assert.ok(m24(btc).score! > m24(sol).score!);
+  assert.match(m24(btc).detail, /σ · norma ±/);
+  assert.equal(sol.coin.score, sol.sentiment);
 });

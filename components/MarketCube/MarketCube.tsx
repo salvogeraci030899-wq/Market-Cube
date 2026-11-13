@@ -177,6 +177,19 @@ export default function MarketCube() {
   const [alertsSupported, setAlertsSupported] = useState(false);
   const [alertMsg, setAlertMsg] = useState<string | null>(null);
 
+  // effetti grafici: spegnibili per dispositivi poco potenti (scelta ricordata; "riduci animazioni" parte già spento)
+  const [lite, setLite] = useState(false);
+  useEffect(() => {
+    const saved = storageGet('mc_fx');
+    setLite(saved ? saved === 'lite' : window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }, []);
+  const toggleLite = () => {
+    setLite((v) => {
+      storageSet('mc_fx', v ? 'full' : 'lite');
+      return !v;
+    });
+  };
+
   useEffect(() => {
     try {
       const ok = typeof Notification !== 'undefined';
@@ -232,6 +245,8 @@ export default function MarketCube() {
   const motion = useRef({ vol: 1, coverage: 1 });
   motion.current = { vol, coverage };
 
+  const liteRef = useRef(false);
+  liteRef.current = lite;
   const rot = useRef({ rx: -18, ry: -25 });
   const focus = useRef<{ rx: number; ry: number } | null>(null);
   const drag = useRef<{ x: number; y: number; id: number } | null>(null);
@@ -269,7 +284,7 @@ export default function MarketCube() {
       let wobble = 0;
       let jx = 0;
       let jy = 0;
-      if (!reduce) {
+      if (!reduce && !liteRef.current) {
         wobble = Math.sin(t * 0.0012) * (1 + v) * 2.5;
         if (v >= 2) {
           jx = Math.sin(t * 0.021) * 1.2;
@@ -347,7 +362,7 @@ export default function MarketCube() {
   const ctx = data.context;
 
   return (
-    <main className={`${styles.container} ${switching ? styles.switching : ''}`} style={cssVars(headVar)}>
+    <main className={`${styles.container} ${switching ? styles.switching : ''} ${lite ? styles.lite : ''}`} style={cssVars(headVar)}>
       <div className={styles.sweep} aria-hidden="true" />
 
       <header className={styles.topbar}>
@@ -530,6 +545,13 @@ export default function MarketCube() {
                 {alertsOn ? 'AVVISI: ON' : 'AVVISI: OFF'}
               </button>
             )}
+            <button
+              className={`${styles.button} ${styles.buttonGhost}`}
+              onClick={toggleLite}
+              title="Spegne scanlines, aloni e animazioni di sfondo: utile su dispositivi poco potenti o per risparmiare batteria"
+            >
+              {lite ? 'EFFETTI: OFF' : 'EFFETTI: ON'}
+            </button>
             <span className={styles.muted}>AGG. {age.toUpperCase()}</span>
             <button className={styles.button} onClick={() => load(true)} disabled={loading}>
               {loading ? 'SYNC…' : 'AGGIORNA'}
@@ -537,8 +559,9 @@ export default function MarketCube() {
           </div>
           {alertMsg && <p className={styles.warningInline}>{alertMsg}</p>}
           <p className={styles.disclaimer}>
-            Punteggio 0–100 per moneta: 24h, 7g, 30g, Fear &amp; Greed, funding e forza relativa (per BTC: ampiezza del mercato). Lo
-            storico usa momentum, trend 30g, una moneta di riferimento e Fear &amp; Greed. Zona alta/bassa = tra il 10% più alto/basso
+            Punteggio 0–100 per moneta: 24h, 7g, 30g, Fear &amp; Greed, funding e forza relativa (per BTC: ampiezza del mercato).
+            Le variazioni sono misurate in unità di volatilità tipica di ciascuna moneta (σ, ultimi 7 giorni): +1σ = +20 punti, quindi i
+            punteggi sono confrontabili tra monete. Lo storico usa momentum, trend 30g, una moneta di riferimento e Fear &amp; Greed. Zona alta/bassa = tra il 10% più alto/basso
             degli ultimi 90 giorni. Indicatore informativo, non è un consiglio finanziario.
           </p>
         </section>
