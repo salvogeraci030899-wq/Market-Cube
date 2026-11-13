@@ -376,3 +376,11 @@
   .zoneGlow { animation: none; filter: drop-shadow(0 0 28px rgb(var(--c))); }
   .face, .tile { transition: none; }
 }
+
+/* ---------- modalità effetti ridotti (interruttore in basso): niente animazioni né aloni pesanti ---------- */
+.lite::after, .lite .sweep, .lite .floorWrap { display: none; }
+.lite .zoneGlow { animation: none; filter: none; }
+.lite .face { box-shadow: none; transition: none; }
+.lite .alert, .lite .glitch, .lite .dot { animation: none; }
+.lite .tile, .lite .metric, .lite .regime, .lite .button, .lite .status { box-shadow: none; text-shadow: none; }
+.lite .score, .lite .title, .lite .faceLabel, .lite .faceValue, .lite .tileScore { text-shadow: none; }

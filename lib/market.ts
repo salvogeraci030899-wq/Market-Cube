@@ -130,6 +130,8 @@ interface CoinRow {
   ch24: number;
   ch7?: number;
   ch30?: number;
+  /** oscillazione giornaliera tipica (deviazione standard dei rendimenti, in frazione: 0.03 = 3%) */
+  sigma?: number;
 }
 
 interface MarketsData {
@@ -155,7 +157,7 @@ const num = (v: unknown): number | undefined => {
 
 async function fetchMarkets(f: Fetcher): Promise<MarketsData> {
   const rows: any[] = await getJson(
-    'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&price_change_percentage=24h,7d,30d',
+    'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&sparkline=true&price_change_percentage=24h,7d,30d',
     f,
   );
   if (!Array.isArray(rows) || rows.length === 0) throw new Error('risposta CoinGecko vuota');
@@ -173,6 +175,7 @@ async function fetchMarkets(f: Fetcher): Promise<MarketsData> {
       ch24,
       ch7: num(r?.price_change_percentage_7d_in_currency),
       ch30: num(r?.price_change_percentage_30d_in_currency),
+      sigma: sigmaFromPrices(r?.sparkline_in_7d?.price, 24),
     });
   }
   if (eligible.length === 0) throw new Error('nessuna moneta valida');
@@ -275,8 +278,31 @@ async function fetchCloses(base: string, interval: '1h' | '1d', limit: number, f
 
 // ---------------------------------------------------------------- calcoli (puri, testabili)
 
-export const scoreMomentum = (changePct: number, perPoint = 5) => clamp(50 + changePct * perPoint);
-export const scoreTrend = (price: number, sma: number) => clamp(50 + ((price / sma - 1) * 100) * 2.5);
+/** Oscillazione giornaliera di riferimento se di una moneta non si conosce la volatilità (tipica del mercato crypto). */
+export const DEFAULT_SIGMA = 0.03;
+/** Punti di punteggio per ogni deviazione standard: ±2.5σ = estremo (0 o 100). */
+const POINTS_PER_SIGMA = 20;
+
+/**
+ * Deviazione standard giornaliera dei rendimenti da una serie di prezzi, in frazione.
+ * stepsPerDay = quanti campioni ci sono in un giorno (24 per prezzi orari, 1 per giornalieri).
+ */
+export function sigmaFromPrices(prices: unknown, stepsPerDay: number): number | undefined {
+  if (!Array.isArray(prices)) return undefined;
+  const closes = prices.map(Number).filter((n) => Number.isFinite(n) && n > 0);
+  if (closes.length < Math.max(30, stepsPerDay * 2)) return undefined;
+  const sd = stdevLogReturns(closes);
+  return Number.isFinite(sd) ? clamp(sd * Math.sqrt(stepsPerDay), 0.004, 0.15) : undefined;
+}
+
+/** Quante volte la variazione supera l'oscillazione normale della moneta sull'orizzonte dato. */
+export const zScore = (changePct: number, sigmaDaily: number, days = 1) => changePct / 100 / (sigmaDaily * Math.sqrt(days));
+/** Variazione % -> punteggio, in unità di volatilità tipica della moneta (confrontabile tra monete). */
+export const scoreMomentum = (changePct: number, sigmaDaily = DEFAULT_SIGMA, days = 1) =>
+  clamp(50 + zScore(changePct, sigmaDaily, days) * POINTS_PER_SIGMA);
+/** Distanza del prezzo dalla media 30g; lo scarto tipico è circa σ·√10. */
+export const scoreTrend = (price: number, sma: number, sigmaDaily = DEFAULT_SIGMA) =>
+  clamp(50 + ((price / sma - 1) / (sigmaDaily * Math.sqrt(10))) * POINTS_PER_SIGMA);
 /** rate = tasso di funding per periodo (es. 0.0001 = 0.01%); 0.01% è la "norma" di mercato. */
 export const scoreFunding = (rate: number) => clamp(55 + (rate * 100 - 0.01) * 1125);
 
@@ -324,6 +350,8 @@ export function regimeFor(sentiment: number | null, volIndex: number | null): st
  */
 export function buildHistory(primary: number[] | null, secondary: number[] | null, fng: number[] | null, days = HISTORY_DAYS): number[] {
   const out: number[] = [];
+  const sigP = sigmaFromPrices(primary, 1) ?? DEFAULT_SIGMA;
+  const sigS = sigmaFromPrices(secondary, 1) ?? DEFAULT_SIGMA;
   for (let k = days - 1; k >= 0; k--) {
     const ms: Metric[] = [];
     const add = (id: MetricId, score: number) => {
@@ -331,12 +359,12 @@ export function buildHistory(primary: number[] | null, secondary: number[] | nul
     };
     if (primary) {
       const i = primary.length - 1 - k;
-      if (i >= 1) add('m24', scoreMomentum((primary[i] / primary[i - 1] - 1) * 100));
-      if (i >= 29) add('trend', scoreTrend(primary[i], avg(primary.slice(i - 29, i + 1))));
+      if (i >= 1) add('m24', scoreMomentum((primary[i] / primary[i - 1] - 1) * 100, sigP));
+      if (i >= 29) add('trend', scoreTrend(primary[i], avg(primary.slice(i - 29, i + 1)), sigP));
     }
     if (secondary) {
       const i = secondary.length - 1 - k;
-      if (i >= 1) add('sec', scoreMomentum((secondary[i] / secondary[i - 1] - 1) * 100));
+      if (i >= 1) add('sec', scoreMomentum((secondary[i] / secondary[i - 1] - 1) * 100, sigS));
     }
     if (fng && k < fng.length) add('fng', clamp(fng[k]));
     const v = aggregate(ms, HISTORY_WEIGHTS);
@@ -382,19 +410,24 @@ export function computeMetrics(i: MetricInputs): Metric[] {
   const isBtc = coin.id === 'bitcoin';
   const ch7 = coin.ch7 ?? derived?.ch7;
   const ch30 = coin.ch30 ?? derived?.ch30;
+  const sig = coin.sigma ?? DEFAULT_SIGMA;
+  const sigDetail = (change: number, days: number) => {
+    const z = zScore(change, sig, days);
+    return `${z >= 0 ? '+' : ''}${z.toFixed(1)}σ · norma ±${(sig * Math.sqrt(days) * 100).toFixed(1)}%`;
+  };
   return FACE_ORDER.map((id): Metric => {
     const s = stale[id] ? { stale: true } : {};
     switch (id) {
       case 'm24':
-        return { id, label: '24 ore', score: scoreMomentum(coin.ch24), value: fmtPct(coin.ch24), detail: fmtUsd(coin.price), ...s };
+        return { id, label: '24 ore', score: scoreMomentum(coin.ch24, sig), value: fmtPct(coin.ch24), detail: sigDetail(coin.ch24, 1), ...s };
       case 'm7':
         return ch7 === undefined
           ? empty(id, '7 giorni')
-          : { id, label: '7 giorni', score: scoreMomentum(ch7, 2.5), value: fmtPct(ch7), detail: 'variazione settimanale', ...s };
+          : { id, label: '7 giorni', score: scoreMomentum(ch7, sig, 7), value: fmtPct(ch7), detail: sigDetail(ch7, 7), ...s };
       case 'm30':
         return ch30 === undefined
           ? empty(id, '30 giorni')
-          : { id, label: '30 giorni', score: scoreMomentum(ch30, 1.25), value: fmtPct(ch30), detail: 'variazione mensile', ...s };
+          : { id, label: '30 giorni', score: scoreMomentum(ch30, sig, 30), value: fmtPct(ch30), detail: sigDetail(ch30, 30), ...s };
       case 'fng':
         return fng
           ? { id, label: 'Fear & Greed', score: clamp(fng.value), value: String(fng.value), detail: `mercato · ${fng.label}`, ...s }
@@ -413,7 +446,8 @@ export function computeMetrics(i: MetricInputs): Metric[] {
           ? {
               id,
               label: 'Forza vs BTC',
-              score: scoreMomentum(coin.ch24 - btc.ch24),
+              // differenza tra le due variazioni, ciascuna misurata in unità della propria volatilità
+              score: clamp(50 + (zScore(coin.ch24, sig) - zScore(btc.ch24, btc.sigma ?? DEFAULT_SIGMA)) * 14),
               value: fmtPct(coin.ch24 - btc.ch24),
               detail: 'differenza 24h rispetto a BTC',
               ...s,
@@ -555,14 +589,19 @@ export async function getSnapshot(coinId = 'bitcoin', opts: SnapshotOptions = {}
     derived.ch7 = (last / daily.v[daily.v.length - 8] - 1) * 100;
     derived.ch30 = (last / daily.v[daily.v.length - 31] - 1) * 100;
   }
+  // se CoinGecko non ha dato la volatilità della moneta, la si ricava dalle candele giornaliere
+  const dailySigma = daily.v ? sigmaFromPrices(daily.v.slice(-(HISTORY_DAYS + 1)), 1) : undefined;
+  const selRow: CoinRow = sel.sigma === undefined && dailySigma !== undefined ? { ...sel, sigma: dailySigma } : sel;
   const metrics = computeMetrics({
-    coin: sel,
+    coin: selRow,
     ...shared,
     funding: funding.v?.[sel.symbol],
     derived: usingExchangeMarkets ? derived : undefined,
     stale: staleOf(),
   });
   const sentiment = aggregate(metrics);
+  // la tessera della moneta scelta mostra lo stesso numero del titolo
+  const coinsOut = coins.map((c) => (c.id === sel.id ? { ...c, score: sentiment } : c));
 
   const annualizedPct = hourly.v ? realizedVolAnnualizedPct(hourly.v) : NaN;
   const normal = daily.v ? dailyVolAnnualizedPct(daily.v.slice(-(HISTORY_DAYS + 1))) : NaN;
@@ -584,8 +623,8 @@ export async function getSnapshot(coinId = 'bitcoin', opts: SnapshotOptions = {}
   const available = metrics.filter((m) => m.score !== null).length;
 
   return {
-    coin: tileFor(sel),
-    coins,
+    coin: { ...tileFor(sel), score: sentiment },
+    coins: coinsOut,
     sentiment,
     regime: regimeFor(sentiment, index),
     volatility: {
